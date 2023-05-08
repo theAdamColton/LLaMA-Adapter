@@ -1,23 +1,24 @@
 """Implementation of the paper:
-
 LLaMA-Adapter: Efficient Fine-tuning of Language Models with Zero-init Attention
 https://arxiv.org/abs/2303.16199
 """
 # mypy: ignore-errors
 import math
 from dataclasses import dataclass
+from typing import Optional
 
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import lit_llama.model as llama
-from lit_llama.model import build_rope_cache, apply_rope, RMSNorm, MLP
+from lit_llama.model import build_rope_cache, apply_rope, RMSNorm, find_multiple
 
 
 @dataclass
 class LLaMAConfig(llama.LLaMAConfig):
     adapter_prompt_length: int = 10
     adapter_start_layer: int = 2
+    add_bias_and_scale: bool = False
 
 
 class CausalSelfAttention(nn.Module):
@@ -32,6 +33,16 @@ class CausalSelfAttention(nn.Module):
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=False)
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=False)
+
+        if config.add_bias_and_scale:
+            self.c_attn_bias = nn.Parameter(torch.zeros([config.n_embd*3]))
+            self.c_attn_scale = nn.Parameter(torch.ones([config.n_embd*3]))
+
+            self.c_proj_bias = nn.Parameter(torch.zeros([config.n_embd]))
+            self.c_proj_scale = nn.Parameter(torch.zeros([config.n_embd]))
+        else:
+            self.c_attn_bias = self.c_attn_scale = None
+            self.c_proj_bias = self.c_proj_scale = None
         
         if block_idx >= config.adapter_start_layer:
             # adapter embedding layer
@@ -51,7 +62,10 @@ class CausalSelfAttention(nn.Module):
         B, T, C = x.size()  # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+        q, k, v = forward_linear_with_scale(x, 
+                                            self.c_attn,
+                                            self.c_attn_bias, 
+                                            self.c_attn_scale).split(self.n_embd, dim=2)
 
         head_size = C // self.n_head
         k = k.view(B, T, self.n_head, head_size).transpose(1, 2)  # (B, nh, T, hs)
@@ -94,7 +108,7 @@ class CausalSelfAttention(nn.Module):
         y = y.transpose(1, 2).contiguous().view(B, T, C)  # re-assemble all head outputs side by side
 
         # output projection
-        y = self.c_proj(y)
+        y = forward_linear_with_scale(y, self.c_proj, self.c_proj_bias, self.c_proj_scale)
 
         return y
 
@@ -116,6 +130,39 @@ class Block(nn.Module):
         return x
 
 
+class MLP(nn.Module):
+    def __init__(self, config: LLaMAConfig) -> None:
+        super().__init__()
+        hidden_dim = 4 * config.n_embd
+        n_hidden = int(2 * hidden_dim / 3)
+        n_hidden = find_multiple(n_hidden, 256)
+
+        self.c_fc1 = nn.Linear(config.n_embd, n_hidden, bias=False)
+        self.c_fc2 = nn.Linear(config.n_embd, n_hidden, bias=False)
+        self.c_proj = nn.Linear(n_hidden, config.n_embd, bias=False)
+
+        if config.add_bias_and_scale:
+            self.c_fc1_bias = nn.Parameter(torch.zeros([config.n_embd]))
+            self.c_fc1_scale = nn.Parameter(torch.ones([config.n_embd]))
+
+            self.c_fc2_bias = nn.Parameter(torch.zeros([config.n_embd]))
+            self.c_fc2_scale = nn.Parameter(torch.ones([config.n_embd]))
+
+            self.c_proj_bias = nn.Parameter(torch.zeros([n_hidden]))
+            self.c_proj_scale = nn.Parameter(torch.ones([n_hidden]))
+        else:
+            self.c_fc1_bias = self.c_fc1_scale = self.c_fc2_bias = None
+            self.c_fc2_scale = self.c_proj_bias = self.c_proj_scale = None
+
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = F.silu(forward_linear_with_scale(x, self.c_fc1, self.c_fc1_bias, self.c_fc1_scale)) \
+            * forward_linear_with_scale(x, self.c_fc2, self.c_fc2_bias, self.c_fc2_scale)
+        x = forward_linear_with_scale(x, self.c_proj, self.c_proj_bias, self.c_proj_scale)
+        return x
+
+
+
 class LLaMA(llama.LLaMA):
     """The implementation is identical to `lit_llama.model.LLaMA` with the exception that
     the `Block` saves the layer index and passes it down to the attention layer."""
@@ -127,6 +174,13 @@ class LLaMA(llama.LLaMA):
         self.config = config
 
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+
+        if config.add_bias_and_scale:
+            self.lm_head_bias = nn.Parameter(torch.zeros([config.n_embd]))
+            self.lm_head_scale = nn.Parameter(torch.ones([config.n_embd]))
+        else:
+            self.lm_head_bias = self.lm_head_scale = None
+
         self.transformer = nn.ModuleDict(
             dict(
                 wte=nn.Embedding(config.vocab_size, config.n_embd),
@@ -134,6 +188,26 @@ class LLaMA(llama.LLaMA):
                 ln_f=RMSNorm(config.n_embd),
             )
         )
+
+    def forward(self, idx: torch.Tensor) -> torch.Tensor:
+        """
+        Same as `lit_llama.model.LLaMa` but possibly with bias and scale
+        """
+        _, t = idx.size()
+        assert (
+            t <= self.config.block_size
+        ), f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
+
+        # forward the LLaMA model itself
+        x = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
+
+        for block in self.transformer.h:
+            x = block(x)
+        x = self.transformer.ln_f(x)
+
+        logits = forward_linear_with_scale(x, self.lm_head, self.lm_head_bias, self.lm_head_scale)  # (b, t, vocab_size)
+
+        return logits
 
     @classmethod
     def from_name(cls, name: str):
@@ -149,3 +223,17 @@ def mark_only_adapter_as_trainable(model: LLaMA) -> None:
 def adapter_state_from_state_dict(state_dict: dict) -> dict:
     """Returns the model state dict with only the adapter weights for saving."""
     return {name: param for name, param in state_dict.items() if "adapter_wte" in name or "gating_factor" in name}
+
+
+def forward_linear_with_scale(x, module, scale:Optional[nn.Parameter], bias:Optional[nn.Parameter]):
+    """
+    This is written as notated in the llama adapter v2 paper. However, in the llama
+    adapter v2 code, they apply scale before applying the bias factor.
+    """
+    x = module(x)
+    if bias is not None:
+        x = x + bias
+    if scale is not None:
+        x = x * scale
+    return x
+
