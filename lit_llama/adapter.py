@@ -3,7 +3,6 @@ LLaMA-Adapter: Efficient Fine-tuning of Language Models with Zero-init Attention
 https://arxiv.org/abs/2303.16199
 """
 # mypy: ignore-errors
-import math
 from dataclasses import dataclass
 from typing import Optional
 
@@ -215,20 +214,28 @@ class LLaMA(llama.LLaMA):
 
 
 def mark_only_adapter_as_trainable(model: LLaMA) -> None:
-    """Sets `requires_grad=False` for all non-adapter weights."""
+    """Sets `requires_grad=False` for all non-adapter or bias/scale weights."""
     for name, param in model.named_parameters():
-        param.requires_grad = "adapter_wte" in name or "gating_factor" in name
+        requires_grad = ("adapter_wte" in name
+                         or "gating_factor" in name
+                         or "_bias" in name
+                         or "_scale" in name
+                         )
+        param.requires_grad = requires_grad
 
 
 def adapter_state_from_state_dict(state_dict: dict) -> dict:
-    """Returns the model state dict with only the adapter weights for saving."""
-    return {name: param for name, param in state_dict.items() if "adapter_wte" in name or "gating_factor" in name}
+    """Returns the model state dict with only the adapter weights or bias/scale for saving."""
+    name_allow_list = ["adapter_wte", "gating_factor", "_bias", "_scale"]
+    return {name: param for name, param in state_dict.items() if any(name_allow in name for name_allow in name_allow_list)}
 
 
 def forward_linear_with_scale(x, module, scale:Optional[nn.Parameter], bias:Optional[nn.Parameter]):
     """
     This is written as notated in the llama adapter v2 paper. However, in the llama
     adapter v2 code, they apply scale before applying the bias factor.
+
+    y = scale * x + b
     """
     x = module(x)
     if bias is not None:
